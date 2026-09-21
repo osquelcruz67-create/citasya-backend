@@ -1,5 +1,5 @@
 """
-CitasYa Backend Patch v3.0
+CitasYa Backend Patch v3.1
 Maneja las rutas admin directamente y proxea todo lo demás al backend original.
 """
 
@@ -25,10 +25,12 @@ UPSTREAM_URL = os.environ.get("UPSTREAM_URL", "")  # URL del backend original
 ADMIN_EMAILS    = {"osquelcruz67@gmail.com", "osquelcruz55@gmail.com"}
 _ADMIN_EMAILS_LC = {e.lower() for e in ADMIN_EMAILS}
 
+RESET_SECRET = os.environ.get("RESET_SECRET", "citasya-reset-2026")
+
 # ------------------------------------------------------------------------------
 # App
 # ------------------------------------------------------------------------------
-app = FastAPI(title="CitasYa Backend Patch", version="3.0")
+app = FastAPI(title="CitasYa Backend Patch", version="3.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -125,6 +127,34 @@ async def get_stats(_user=Depends(_require_admin)):
 
 def _serialize(doc: dict) -> dict:
     return {k: str(v) if isinstance(v, ObjectId) else v for k, v in doc.items()}
+
+
+# ------------------------------------------------------------------------------
+# Endpoint temporal: borrar usuario por email (solo para admin emails)
+# ------------------------------------------------------------------------------
+@app.delete("/api/debug/delete-user")
+async def delete_user(email: str = Query(...), secret: str = Query(...)):
+    if secret != RESET_SECRET:
+        raise HTTPException(status_code=403, detail="Acceso denegado")
+    if email.lower() not in _ADMIN_EMAILS_LC:
+        raise HTTPException(status_code=403, detail="Solo para cuentas admin")
+    if not db:
+        raise HTTPException(status_code=503, detail="MongoDB no configurado")
+    result = await db.users.delete_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
+    return {"deleted": result.deleted_count, "email": email}
+
+
+@app.get("/api/debug/check-user")
+async def check_user(email: str = Query(...), secret: str = Query(...)):
+    if secret != RESET_SECRET:
+        raise HTTPException(status_code=403, detail="Acceso denegado")
+    if not db:
+        raise HTTPException(status_code=503, detail="MongoDB no configurado")
+    user = await db.users.find_one(
+        {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}},
+        {"_id": 0, "password_hash": 0}
+    )
+    return {"found": user is not None, "user": user}
 
 
 # ------------------------------------------------------------------------------
