@@ -119,7 +119,7 @@ async def list_users(
 async def get_stats(_user=Depends(_require_admin)):
     total_users   = await db.users.count_documents({})
     active_users  = await db.users.count_documents({"status": "active"})
-    total_videos  = aawait db.videos.count_documents({})
+    total_videos  = await db.videos.count_documents({})
     return {"total_users": total_users, "active_users": active_users, "total_videos": total_videos}
 
 
