@@ -1,21 +1,21 @@
 """
-CitasYa Backend Patch v3.2
+CitasYa Backend Patch v3.3
 """
 
-import os, re, json
-from datetime import datetime, timezone
+import os, re
+from datetime import datetime
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Header, Query, Depends, Request, Response, Body
+from fastapi import FastAPI, HTTPException, Header, Query, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from passlib.context import CryptContext
+import asyncio
 
 MONGO_URL    = os.environ.get("MONGO_URL", os.environ.get("MONGODB_URL", ""))
 DB_NAME      = os.environ.get("DB_NAME", "citasya")
-PORT         = int(os.environ.get("PORT", "8000"))
 UPSTREAM_URL = os.environ.get("UPSTREAM_URL", "")
 
 ADMIN_EMAILS    = {"osquelcruz67@gmail.com", "osquelcruz55@gmail.com"}
@@ -24,7 +24,7 @@ RESET_SECRET = os.environ.get("RESET_SECRET", "citasya-reset-2026")
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-app = FastAPI(title="CitasYa Backend Patch", version="3.2")
+app = FastAPI(title="CitasYa Backend Patch", version="3.3")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,9 +42,14 @@ http_client: Optional[httpx.AsyncClient] = None
 async def startup():
     global client, db, http_client
     if MONGO_URL:
-        client = AsyncIOMotorClient(MONGO_URL)
+        client = AsyncIOMotorClient(
+            MONGO_URL,
+            serverSelectionTimeoutMS=8000,
+            socketTimeoutMS=8000,
+            connectTimeoutMS=8000,
+        )
         db = client[DB_NAME]
-        print(f"[patch] MongoDB conectado: {DB_NAME}")
+        print(f"[patch] MongoDB conectado: {DBN_NAME}")
     if UPSTREAM_URL:
         http_client = httpx.AsyncClient(base_url=UPSTREAM_URL, timeout=30.0)
         print(f"[patch] Upstream: {UPSTREAM_URL}")
@@ -106,29 +111,34 @@ async def _verify_token(token: str) -> Optional[dict]:
 async def db_status(secret: str = Query(...)):
     if secret != RESET_SECRET:
         raise HTTPException(status_code=403, detail="Acceso denegado")
-    if not db:
-        return {"connected": False, "mongo_url_set": bool(MONGO_URL)}
+    info = {"db_object_set": db is not None, "mongo_url_set": bool(MONGO_URL), "db_name": DB_NAME}
+    if db is None:
+        return {"connected": False, **info}
     try:
-        count = await db.users.count_documents({})
-        return {"connected": True, "users_count": count, "db": DB_NAME}
+        count = await asyncio.wait_for(db.users.count_documents({}), timeout=8.0)
+        return {"connected": True, "users_count": count, **info}
+    except asyncio.TimeoutError:
+        return {"connected": False, "error": "timeout 8s", **info}
     except Exception as e:
-        return {"connected": False, "error": str(e)}
+        return {"connected": False, "error": str(e)[:300], **info}
 
 
 @app.get("/api/debug/check-user")
 async def check_user(email: str = Query(...), secret: str = Query(...)):
     if secret != RESET_SECRET:
         raise HTTPException(status_code=403, detail="Acceso denegado")
-    if not db:
+    if db is None:
         raise HTTPException(status_code=503, detail="MongoDB no configurado")
     try:
-        user = await db.users.find_one(
-            {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}},
-            {"password_hash": 0, "password": 0}
+        user = await asyncio.wait_for(
+            db.users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}, {"password_hash": 0, "password": 0}),
+            timeout=8.0
         )
         return {"found": user is not None, "user": _serialize(user) if user else None}
+    except asyncio.TimeoutError:
+        return {"found": False, "error": "timeout"}
     except Exception as e:
-        return {"found": False, "error": str(e)}
+        return {"found": False, "error": str(e)[:300]}
 
 
 @app.post("/api/debug/reset-password")
@@ -141,20 +151,25 @@ async def reset_password(
         raise HTTPException(status_code=403, detail="Acceso denegado")
     if email.lower() not in _ADMIN_EMAILS_LC:
         raise HTTPException(status_code=403, detail="Solo cuentas admin")
-    if not db:
+    if db is None:
         raise HTTPException(status_code=503, detail="MongoDB no configurado")
     try:
         new_hash = pwd_ctx.hash(new_password)
         for field in ["password_hash", "hashed_password", "password"]:
-            result = await db.users.update_one(
-                {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}},
-                {"$set": {field: new_hash}}
+            result = await asyncio.wait_for(
+                db.users.update_one(
+                    {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}},
+                    {"$set": {field: new_hash}}
+                ),
+                timeout=8.0
             )
             if result.matched_count > 0:
                 return {"updated": True, "field": field, "email": email}
         return {"updated": False, "reason": "User not found in this DB"}
+    except asyncio.TimeoutError:
+        return {"updated": False, "error": "timeout"}
     except Exception as e:
-        return {"updated": False, "error": str(e)}
+        return {"updated": False, "error": str(e)[:300]}
 
 
 @app.delete("/api/debug/delete-user")
@@ -163,13 +178,18 @@ async def delete_user(email: str = Query(...), secret: str = Query(...)):
         raise HTTPException(status_code=403, detail="Acceso denegado")
     if email.lower() not in _ADMIN_EMAILS_LC:
         raise HTTPException(status_code=403, detail="Solo cuentas admin")
-    if not db:
+    if db is None:
         raise HTTPException(status_code=503, detail="MongoDB no configurado")
     try:
-        result = await db.users.delete_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
+        result = await asyncio.wait_for(
+            db.users.delete_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}),
+            timeout=8.0
+        )
         return {"deleted": result.deleted_count, "email": email}
+    except asyncio.TimeoutError:
+        return {"deleted": 0, "error": "timeout"}
     except Exception as e:
-        return {"deleted": 0, "error": str(e)}
+        return {"deleted": 0, "error": str(e)[:300]}
 
 
 @app.get("/api/admin/users")
